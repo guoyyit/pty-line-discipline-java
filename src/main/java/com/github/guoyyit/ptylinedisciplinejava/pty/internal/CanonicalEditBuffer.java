@@ -1,14 +1,16 @@
 package com.github.guoyyit.ptylinedisciplinejava.pty.internal;
 
-import com.github.guoyyit.ptylinedisciplinejava.pty.OverflowPolicy;
 import com.github.guoyyit.ptylinedisciplinejava.pty.internal.boundedbuffer.BoundedByteBuffer;
 
 import java.io.ByteArrayOutputStream;
 
 /**
  * Holds the canonical-mode line currently being edited. Bytes are only admitted
- * once a free slot exists in the deliverable input buffer, so a completed line
- * is always committed atomically and never split across writes.
+ * while the deliverable input buffer still has a free slot for them, counting
+ * the bytes already pending here: the invariant
+ * {@code inputBuffer.size() + pending.size() <= capacity} guarantees that a
+ * completed line is always committed atomically, never split across writes and
+ * never overflows the configured capacity.
  *
  * <p>All methods must be invoked while holding the session lock (which is also
  * the monitor of {@code inputBuffer}).
@@ -47,18 +49,20 @@ final class CanonicalEditBuffer {
 
     /**
      * Admit a regular byte into the pending line once input buffer space exists.
+     * The pending bytes count as reserved slots, so the wait asks for
+     * {@code pending.size() + 1} free bytes rather than a single one.
      *
-     * @return {@code false} for BLOCK policy if the timeout elapsed before space
-     *         was available (caller stops consuming); {@code true} otherwise
+     * @param waitMillis maximum wait for space (0 = non-blocking check)
+     * @return {@code true} if the byte was admitted into the pending line,
+     *         {@code false} if no reserved slot was available in time
      */
-    boolean appendReserved(BoundedByteBuffer inputBuffer, byte b, long timeoutMillis,
-                           OverflowPolicy policy, Object sessionLock)
+    boolean appendReserved(BoundedByteBuffer inputBuffer, byte b, long waitMillis)
             throws InterruptedException {
-        if (inputBuffer.awaitSpaceHeld(1, timeoutMillis)) {
+        if (inputBuffer.awaitSpaceHeld(pending.size() + 1, waitMillis)) {
             pending.write(b & 0xff);
             return true;
         }
-        return policy == OverflowPolicy.DISCARD;
+        return false;
     }
 
     /**

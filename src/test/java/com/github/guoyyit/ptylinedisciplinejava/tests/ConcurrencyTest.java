@@ -8,6 +8,7 @@ import com.github.guoyyit.ptylinedisciplinejava.pty.PtySessionManager;
 import com.github.guoyyit.ptylinedisciplinejava.pty.ReadResult;
 import com.github.guoyyit.ptylinedisciplinejava.pty.SessionConfig;
 import com.github.guoyyit.ptylinedisciplinejava.pty.SessionHolder;
+import com.github.guoyyit.ptylinedisciplinejava.pty.WriteResult;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -15,12 +16,15 @@ import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ConcurrencyTest {
@@ -203,5 +207,157 @@ class ConcurrencyTest {
         pool.shutdown();
         pool.awaitTermination(10, TimeUnit.SECONDS);
         assertEquals(totalLines, seen);
+    }
+
+    private PtySession newCanonicalSession(String holderId, int capacity,
+                                           OverflowPolicy policy) {
+        SessionHolder holder = manager.createHolder(holderId);
+        return holder.createSession(new SessionConfig(
+                LineDisciplineMode.CANONICAL,
+                com.github.guoyyit.ptylinedisciplinejava.pty.ControlCharacters.defaults(),
+                new BufferLimits(capacity, policy),
+                new BufferLimits(4096, OverflowPolicy.BLOCK),
+                3072, 1024, 1, 0, 64,
+                com.github.guoyyit.ptylinedisciplinejava.pty.SignalDeliveryPolicy.QUEUE));
+    }
+
+    @Test
+    void concurrentCanonicalWritersNeverExceedInputCapacity() throws Exception {
+        int capacity = 64;
+        PtySession session = newCanonicalSession("holder-cap-block", capacity,
+                OverflowPolicy.BLOCK);
+
+        int writers = 4;
+        int linesPerWriter = 50;
+        ExecutorService pool = Executors.newFixedThreadPool(writers);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicReference<Throwable> writerFailure = new AtomicReference<>();
+
+        for (int w = 0; w < writers; w++) {
+            final byte tag = (byte) ('A' + w);
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    byte[] line = new byte[8];
+                    Arrays.fill(line, 0, 7, tag);
+                    line[7] = '\n';
+                    for (int i = 0; i < linesPerWriter; i++) {
+                        int offset = 0;
+                        while (offset < line.length) {
+                            WriteResult r = session.writeInput(
+                                    Arrays.copyOfRange(line, offset, line.length),
+                                    2000);
+                            offset += r.bytesAccepted();
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (Throwable t) {
+                    writerFailure.compareAndSet(null, t);
+                }
+            });
+        }
+
+        int totalLines = writers * linesPerWriter;
+        int[] counts = new int[writers];
+        int lines = 0;
+        long totalBytes = 0;
+        start.countDown();
+        long deadline = System.currentTimeMillis() + 30000;
+        while (lines < totalLines && System.currentTimeMillis() < deadline) {
+            ReadResult r = session.readInput(256, 5000);
+            assertTrue(session.inputBufferSize() <= capacity,
+                    "occupancy exceeded capacity: " + session.inputBufferSize());
+            byte[] data = r.data();
+            if (data.length == 0) {
+                continue;
+            }
+            assertTrue(data[data.length - 1] == '\n',
+                "every read must end at a line boundary");
+            totalBytes += data.length;
+            for (int i = 0; i < data.length - 1; i++) {
+                counts[data[i] - 'A']++;
+            }
+            lines++;
+        }
+        assertEquals(totalLines, lines, "not all committed lines were delivered");
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
+        assertNull(writerFailure.get());
+        assertEquals((long) totalLines * 8, totalBytes,
+                "every accepted byte must be delivered exactly once");
+        for (int w = 0; w < writers; w++) {
+            assertEquals(linesPerWriter * 7, counts[w],
+                    "writer " + (char) ('A' + w) + " byte count");
+        }
+        assertTrue(session.inputBufferSize() <= capacity);
+    }
+
+    @Test
+    void concurrentCanonicalDiscardWritersKeepAccountingConsistent() throws Exception {
+        int capacity = 32;
+        PtySession session = newCanonicalSession("holder-cap-discard", capacity,
+                OverflowPolicy.DISCARD);
+
+        int writers = 4;
+        int linesPerWriter = 40;
+        ExecutorService pool = Executors.newFixedThreadPool(writers);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+
+        for (int w = 0; w < writers; w++) {
+            final byte tag = (byte) ('A' + w);
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    byte[] line = new byte[16];
+                    Arrays.fill(line, 0, 15, tag);
+                    line[15] = '\n';
+                    for (int i = 0; i < linesPerWriter; i++) {
+                        WriteResult r = session.writeInput(line, 0);
+                        if (r.bytesAccepted() + r.bytesDiscarded() != line.length) {
+                            throw new AssertionError("accepted + discarded != offered: "
+                                    + r);
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (Throwable t) {
+                    failure.compareAndSet(null, t);
+                }
+            });
+        }
+
+        AtomicReference<Throwable> readerFailure = new AtomicReference<>();
+        CountDownLatch stopReader = new CountDownLatch(1);
+        Thread reader = new Thread(() -> {
+            try {
+                while (stopReader.getCount() > 0) {
+                    ReadResult r = session.readInput(64, 100);
+                    if (session.inputBufferSize() > capacity) {
+                        throw new AssertionError(
+                                "occupancy exceeded capacity: " + session.inputBufferSize());
+                    }
+                    byte[] data = r.data();
+                    if (data.length > 0 && data[data.length - 1] != '\n') {
+                        throw new AssertionError("partial line delivered");
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Throwable t) {
+                readerFailure.compareAndSet(null, t);
+            }
+        });
+        reader.start();
+
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(20, TimeUnit.SECONDS));
+        stopReader.countDown();
+        reader.join(5000);
+        assertNull(failure.get());
+        assertNull(readerFailure.get());
+        assertTrue(session.inputBufferSize() <= capacity);
     }
 }

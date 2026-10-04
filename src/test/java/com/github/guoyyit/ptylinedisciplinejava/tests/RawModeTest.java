@@ -127,6 +127,73 @@ class RawModeTest {
         assertTrue(System.currentTimeMillis() - start >= 40);
     }
 
+    @Test
+    void callerTimeoutAppliesWhenVminPartiallyFilledAndVtimeZero() throws Exception {
+        PtySession s = manager.createHolder("h-vmin-partial").createSession(rawConfig(5, 0));
+        s.writeInput(new byte[]{'a', 'b'}, 1000);
+
+        long start = System.currentTimeMillis();
+        var result = s.readInput(64, 150);
+        long elapsed = System.currentTimeMillis() - start;
+
+        // Must return near the caller timeout, not block until VMIN is met.
+        assertTrue(elapsed >= 120, "should wait for the caller timeout: " + elapsed);
+        assertTrue(elapsed < 3000, "caller timeout must bound the wait: " + elapsed);
+        // The partially buffered bytes are delivered, flagged as a timeout.
+        assertArrayEquals(new byte[]{'a', 'b'}, result.data());
+        assertTrue(result.timedOut());
+        assertFalse(result.eof());
+        assertFalse(result.hangup());
+    }
+
+    @Test
+    void callerTimeoutWithEmptyBufferAndVtimeZeroReturnsNoData() throws Exception {
+        PtySession s = manager.createHolder("h-vmin-empty").createSession(rawConfig(4, 0));
+        long start = System.currentTimeMillis();
+        var result = s.readInput(64, 120);
+        long elapsed = System.currentTimeMillis() - start;
+        assertEquals(0, result.bytesRead());
+        assertTrue(result.timedOut());
+        assertTrue(elapsed >= 90, "should wait for the caller timeout: " + elapsed);
+        assertTrue(elapsed < 3000, "caller timeout must bound the wait: " + elapsed);
+    }
+
+    @Test
+    void callerTimeoutBeatsLongVtimeIdleTimer() throws Exception {
+        PtySession s = manager.createHolder("h-vmin-vtime-caller")
+                .createSession(rawConfig(10, 5000));
+        s.writeInput(new byte[]{'x', 'y', 'z'}, 1000);
+
+        long start = System.currentTimeMillis();
+        var result = s.readInput(64, 150);
+        long elapsed = System.currentTimeMillis() - start;
+
+        assertTrue(elapsed < 2000, "caller timeout must win over VTIME: " + elapsed);
+        assertArrayEquals(new byte[]{'x', 'y', 'z'}, result.data());
+        assertTrue(result.timedOut());
+    }
+
+    @Test
+    void callerTimeoutBeatsLongVtimeWhenBufferEmpty() throws Exception {
+        PtySession s = manager.createHolder("h-v0-vtime-caller")
+                .createSession(rawConfig(0, 5000));
+        long start = System.currentTimeMillis();
+        var result = s.readInput(64, 120);
+        long elapsed = System.currentTimeMillis() - start;
+        assertEquals(0, result.bytesRead());
+        assertTrue(result.timedOut());
+        assertTrue(elapsed < 2000, "caller timeout must win over VTIME: " + elapsed);
+    }
+
+    @Test
+    void satisfiedVminIsNotReportedAsTimeout() throws Exception {
+        PtySession s = manager.createHolder("h-vmin-met").createSession(rawConfig(2, 0));
+        s.writeInput(new byte[]{'p', 'q'}, 1000);
+        var result = s.readInput(64, 1000);
+        assertArrayEquals(new byte[]{'p', 'q'}, result.data());
+        assertFalse(result.timedOut());
+    }
+
     private record ReadResultProbe(int bytes, boolean timedOut) {
     }
 
