@@ -113,9 +113,13 @@ class CanonicalModeTest {
     }
 
     private void writeInput(String text) throws InterruptedException {
+        byte[] offered = text.getBytes(StandardCharsets.UTF_8);
         WriteResult result = session.writeInput(
-                text.getBytes(StandardCharsets.UTF_8), 1000);
-        assertTrue(result.fullyAccepted(text.getBytes(StandardCharsets.UTF_8).length),
+                offered, 1000);
+        assertFalse(result.timedOut(), result::toString);
+        assertEquals(0, result.bytesDiscarded(), result::toString);
+        assertTrue(result.bytesAccepted() >= 0
+                        && result.bytesAccepted() <= offered.length,
                 result::toString);
     }
 }

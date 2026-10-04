@@ -127,6 +127,59 @@ class RawModeTest {
         assertTrue(System.currentTimeMillis() - start >= 40);
     }
 
+    @Test
+    void callerTimeoutReturnsBufferedBytesWhenVminUnmetAndVtimeZero() throws Exception {
+        PtySession s = manager.createHolder("h-vmin-timeout")
+                .createSession(rawConfig(5, 0));
+        s.writeInput(new byte[]{'a', 'b'}, 1000);
+
+        long start = System.currentTimeMillis();
+        var result = s.readInput(64, 80);
+        long elapsed = System.currentTimeMillis() - start;
+
+        assertArrayEquals(new byte[]{'a', 'b'}, result.data());
+        assertTrue(result.timedOut(), "caller timeout ends the wait early");
+        assertTrue(elapsed >= 50, "should still wait for the timeout: " + elapsed);
+        assertTrue(elapsed < 1000, "must not block until VMIN arrives: " + elapsed);
+    }
+
+    @Test
+    void callerTimeoutZeroWaitsForVminWhenVtimeZero() throws Exception {
+        PtySession s = manager.createHolder("h-vmin-no-timeout")
+                .createSession(rawConfig(3, 0));
+        s.writeInput(new byte[]{'a'}, 1000);
+        Thread writer = new Thread(() -> {
+            try {
+                Thread.sleep(80);
+                s.writeInput(new byte[]{'b', 'c'}, 1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        writer.start();
+        long start = System.currentTimeMillis();
+        var result = s.readInput(64, 0);
+        writer.join();
+        assertArrayEquals(new byte[]{'a', 'b', 'c'}, result.data());
+        assertFalse(result.timedOut());
+        assertTrue(System.currentTimeMillis() - start >= 60);
+    }
+
+    @Test
+    void callerTimeoutCapsInterByteTimerWhenVminAndVtimePositive() throws Exception {
+        PtySession s = manager.createHolder("h-vmin-vtime-cap")
+                .createSession(rawConfig(5, 5000));
+        s.writeInput(new byte[]{'a'}, 1000);
+
+        long start = System.currentTimeMillis();
+        var result = s.readInput(64, 80);
+        long elapsed = System.currentTimeMillis() - start;
+
+        assertArrayEquals(new byte[]{'a'}, result.data());
+        assertTrue(result.timedOut());
+        assertTrue(elapsed < 1000, "caller timeout caps the inter-byte timer: " + elapsed);
+    }
+
     private record ReadResultProbe(int bytes, boolean timedOut) {
     }
 

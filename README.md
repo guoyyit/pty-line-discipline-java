@@ -48,6 +48,19 @@ holder.close();   // 或 session.close() / manager.shutdown()
     待编辑行为空时向读取方报告 EOF。
 - VINTR / VQUIT / VSTOP / VSTART 等控制字符被解释，不作为普通输入字节交付。
 - 一整行若大于调用方 `maxBytes`，会在后续读取中继续交付剩余部分。
+- 输入缓冲容量对整行写入同样生效：待编辑行中尚未提交的字节也计入
+  `inputBufferSize()`，任何时刻“已交付队列 + 待编辑行”的总占用都不超过
+  `BufferLimits.capacity()`；整行原子提交，绝不会出现行首被行尾覆盖。
+  - `OverflowPolicy.BLOCK`：剩余容量不足以再放下一个字节时写入等待，直到
+    读取方腾出空间；等待严格遵守调用方超时，超时后 `WriteResult.timedOut()`
+    为 `true`，`bytesAccepted` 只包含已进入缓冲的前缀，`bytesDiscarded` 为 0，
+    读取方永远不会读到残缺行。
+  - `OverflowPolicy.DISCARD`：一行要么完整放入，要么整行拒绝。放不下的整行
+    从缓冲撤回，`bytesAccepted` 不计入其任何字节，`bytesDiscarded()` 给出
+    该行（含换行符）的字节数；已在队列中的其他行不受影响、不被覆盖。一次
+    写入中的后续行只要放得下仍会被正常接受。
+  - VERASE / VKILL 在容量接近上限时仍可正常编辑：删除字符会立即释放其预留
+    的容量槽位，使后续写入可以继续。
 
 ### 原始模式 RAW
 
@@ -59,8 +72,21 @@ holder.close();   // 或 session.close() / manager.shutdown()
 | --- | --- | --- |
 | 0 | 0 | 纯非阻塞轮询，立即返回当前可用字节（可能为空）。 |
 | 0 | >0 | 单次定时等待，VTIME 内有任意字节即返回，否则超时返回空。 |
-| >0 | 0 | 阻塞直到至少 VMIN 字节（EOF/挂断除外）；调用方超时仅在尚无任何字节时生效。 |
+| >0 | 0 | 默认阻塞直到至少 VMIN 字节（EOF/挂断除外）；若调用方给定大于 0 的超时，则超时优先：到点未凑齐 VMIN 时立即交付已缓冲的部分字节，并在 `ReadResult.timedOut()` 上标记为提前返回。调用方超时为 0 时表示无限等待 VMIN。 |
 | >0 | >0 | 收到首字节后启动字节间计时器：凑齐 VMIN 即返回，或 VTIME 空闲后返回已到字节。 |
+
+调用方 `readInput(maxBytes, timeoutMillis)` 的超时与 VMIN/VTIME 的优先级：
+
+- `timeoutMillis == 0`：不施加调用方超时，完全按 VMIN/VTIME 就绪语义等待
+  （VMIN>0、VTIME=0 时一直阻塞到凑齐 VMIN）。
+- `timeoutMillis > 0`：无论缓冲中是否已有部分字节，读取都必须在该时间内返回。
+  VMIN 凑齐时返回完整结果且 `timedOut=false`；到点未凑齐 VMIN 时交付已缓冲的
+  部分字节并带 `timedOut=true`（VMIN=0、尚无字节时为空数据超时）。
+- VMIN>0、VTIME>0 的字节间计时器与调用方超时取较早者：VTIME 空闲到期返回
+  部分字节时 `timedOut=false`（这是就绪语义的一部分）；调用方超时先到时返回
+  部分字节并带 `timedOut=true`。
+- `data` / `eof` / `hangup` / `timedOut` 组合区分不同结束条件，部分字节交付
+  与超时标记可以同时出现。
 
 ### 模式切换时未交付数据的处理
 
@@ -117,6 +143,9 @@ VEOF=`^D`(0x04)、VSTART=`^Q`(0x11)、VSTOP=`^S`(0x13)。
 - 同一会话支持多写入方与多读取方并发；字节按每次写入的字节块顺序交付，单个字节块
   不会交错；行规程状态转换与缓冲操作在会话锁下原子完成。
 - 输入、输出缓冲均为有界环形缓冲，容量不会无界增长：
+  - 容量约束在会话锁下原子判定与变更：多个写入方同时提交超过剩余容量的数据时，
+    任何时刻 `inputBufferSize()` 都不超过上限，规范模式下每一整行要么完整交付、
+    要么按溢出策略完整拒绝，不会因并发交错而互相覆盖；
   - `OverflowPolicy.BLOCK`：空间不足时阻塞（可带超时），`WriteResult.timedOut()`
     反映超时未全部写入；
   - `OverflowPolicy.DISCARD`：只接受放得下的字节，`bytesAccepted` /
@@ -137,4 +166,6 @@ mvn test
 
 测试覆盖：两种行规程模式、编辑键组合、EOF、特殊字符重配置、信号投递顺序与
 QUEUE/DISCARD、流控高/低水位与 VSTOP/VSTART、模式切换数据保留、并发多读写、
-容量上限与生命周期清理。
+容量上限与生命周期清理、容量小于一行长度时的规范模式写入/读取、两种溢出策略
+下的整行超限反馈、容量接近上限时 VERASE/VKILL 的行为、多写入方并发超限提交，
+以及原始模式 VMIN/VTIME 各组合下调用方超时的优先级。

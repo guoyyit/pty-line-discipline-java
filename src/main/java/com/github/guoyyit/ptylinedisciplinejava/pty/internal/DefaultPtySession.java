@@ -70,20 +70,39 @@ public final class DefaultPtySession implements PtySession {
                 return new WriteResult(0, data.length, false, false, true);
             }
             int consumed;
+            int discarded;
+            boolean timedOut;
             if (config.mode() == LineDisciplineMode.CANONICAL) {
-                consumed = processCanonicalInput(data, timeoutMillis);
+                CanonicalWriteOutcome outcome =
+                        processCanonicalInput(data, timeoutMillis);
+                consumed = outcome.consumed();
+                int accepted = outcome.accepted();
+                discarded = outcome.discarded();
+                timedOut = outcome.timedOut();
+                return new WriteResult(accepted, discarded, timedOut, false, closed);
             } else {
-                int accepted = inputBuffer.offerHeld(data, timeoutMillis);
-                consumed = accepted;
+                boolean blockPolicy = config.input().overflowPolicy()
+                        == com.github.guoyyit.ptylinedisciplinejava.pty.OverflowPolicy.BLOCK;
+                consumed = inputBuffer.offerHeld(data, timeoutMillis);
+                discarded = blockPolicy ? 0 : data.length - consumed;
+                timedOut = consumed < data.length
+                        && blockPolicy
+                        && timeoutMillis > 0
+                        && !closed;
             }
-            boolean timedOut = consumed < data.length
-                    && config.input().overflowPolicy() == com.github.guoyyit.ptylinedisciplinejava.pty.OverflowPolicy.BLOCK
-                    && timeoutMillis > 0
-                    && !closed;
-            boolean isClosed = closed;
-            return new WriteResult(consumed, data.length - consumed,
-                    timedOut, false, isClosed);
+            return new WriteResult(consumed, discarded, timedOut, false, closed);
         }
+    }
+
+    /**
+     * Result of processing one canonical write: how many offered bytes were
+     * stored ({@code accepted}), how many were processed in total
+     * ({@code consumed}, including edited-away control bytes), how many were
+     * refused by the DISCARD policy ({@code discarded}), and whether the BLOCK
+     * policy wait elapsed.
+     */
+    private record CanonicalWriteOutcome(int consumed, int accepted, int discarded,
+                                         boolean timedOut) {
     }
 
     /**
@@ -92,10 +111,20 @@ public final class DefaultPtySession implements PtySession {
      * @return number of bytes from {@code data} consumed (edited-away bytes count
      *         as consumed since they are processed immediately)
      */
-    private int processCanonicalInput(byte[] data, long timeoutMillis)
+    private CanonicalWriteOutcome processCanonicalInput(byte[] data, long timeoutMillis)
             throws InterruptedException {
         ControlCharacters chars = config.controlCharacters();
+        boolean discardPolicy = config.input().overflowPolicy()
+                == com.github.guoyyit.ptylinedisciplinejava.pty.OverflowPolicy.DISCARD;
+        long deadlineNanos = timeoutMillis == 0
+                ? 0L
+                : System.nanoTime() + timeoutMillis * 1_000_000L;
         int index = 0;
+        int accepted = 0;
+        int discarded = 0;
+        int admittedInLine = 0;
+        boolean lineOverflow = false;
+        boolean timedOut = false;
         while (index < data.length && !closed) {
             int b = data[index] & 0xff;
             if (chars.matches(b, chars.intr())) {
@@ -120,18 +149,24 @@ public final class DefaultPtySession implements PtySession {
                 continue;
             }
             if (chars.matches(b, chars.erase())) {
-                eraseOne();
+                editBuffer.eraseOne();
                 index++;
                 continue;
             }
             if (chars.matches(b, chars.kill())) {
-                editBuffer.reset();
+                int reclassified = admitPendingOnKill(admittedInLine, discardPolicy);
+                discarded += reclassified;
+                accepted -= reclassified;
+                admittedInLine = 0;
+                lineOverflow = false;
                 index++;
                 continue;
             }
             if (chars.matches(b, chars.eof())) {
-                if (editBuffer.size() > 0) {
+                if (editBuffer.pendingSize() > 0) {
                     flushPartialLine();
+                    admittedInLine = 0;
+                    lineOverflow = false;
                 } else {
                     inputEof = true;
                     lock.notifyAll();
@@ -140,29 +175,85 @@ public final class DefaultPtySession implements PtySession {
                 continue;
             }
             if (b == '\n') {
-                if (inputBuffer.awaitSpaceHeld(1, timeoutMillis)) {
-                    editBuffer.write('\n');
-                    commitEditLine();
+                if (lineOverflow) {
+                    // DISCARD: the newline closes a line that was refused whole.
+                    lineOverflow = false;
+                    admittedInLine = 0;
+                    discarded++;
                     index++;
                     continue;
                 }
-                if (config.input().overflowPolicy()
-                        == com.github.guoyyit.ptylinedisciplinejava.pty.OverflowPolicy.DISCARD) {
+                if (awaitCanonicalSpace(deadlineNanos, timeoutMillis)) {
+                    editBuffer.admit((byte) '\n');
                     commitEditLine();
-                    break;
+                    accepted++;
+                    admittedInLine = 0;
+                    index++;
+                    continue;
                 }
+                timedOut = true;
                 break;
             }
-            if (!offerCanonicalByte((byte) b, timeoutMillis)) {
+            if (discardPolicy) {
+                if (lineOverflow || editBuffer.isFull(inputBuffer)) {
+                    // A canonical line is indivisible: refuse the whole line.
+                    discarded += admittedInLine + 1;
+                    accepted -= admittedInLine;
+                    admittedInLine = 0;
+                    lineOverflow = true;
+                    editBuffer.discard();
+                    index++;
+                    continue;
+                }
+                editBuffer.admit((byte) b);
+                accepted++;
+                admittedInLine++;
+                index++;
+                continue;
+            }
+            if (!awaitCanonicalSpace(deadlineNanos, timeoutMillis)) {
+                timedOut = true;
                 break;
             }
+            editBuffer.admit((byte) b);
+            accepted++;
+            admittedInLine++;
             index++;
         }
-        return index;
+        return new CanonicalWriteOutcome(index, accepted, discarded, timedOut);
     }
 
-    private void eraseOne() {
-        editBuffer.eraseOne();
+    /**
+     * VKILL clears the pending line. Under DISCARD the pending bytes admitted
+     * by the current write had been accepted provisionally; they are now
+     * reclassified as discarded. Under BLOCK the slots are simply released.
+     */
+    private int admitPendingOnKill(int admittedInLine, boolean discardPolicy) {
+        int reclassified = discardPolicy ? admittedInLine : 0;
+        editBuffer.discard();
+        return reclassified;
+    }
+
+    /**
+     * Wait until one more pending byte fits (deliverable buffer + pending line
+     * must stay within the configured capacity).
+     *
+     * @return {@code true} when space is available, {@code false} on timeout
+     */
+    private boolean awaitCanonicalSpace(long deadlineNanos, long timeoutMillis)
+            throws InterruptedException {
+        while (editBuffer.isFull(inputBuffer) && !closed) {
+            if (timeoutMillis == 0) {
+                return false;
+            }
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0) {
+                return false;
+            }
+            lock.wait(remainingNanos / 1_000_000L,
+                    (int) (remainingNanos % 1_000_000L));
+        }
+        return !editBuffer.isFull(inputBuffer);
     }
 
     private void commitEditLine() {
@@ -171,26 +262,12 @@ public final class DefaultPtySession implements PtySession {
         lock.notifyAll();
     }
 
-    private void flushPartialLine() throws InterruptedException {
-        byte[] partial = editBuffer.peek();
-        if (partial.length > 0) {
-            inputBuffer.offerHeld(partial, 0);
+    private void flushPartialLine() {
+        if (editBuffer.pendingSize() > 0) {
+            editBuffer.flushInto(inputBuffer);
             pendingLineFlushed = true;
         }
-        editBuffer.reset();
         lock.notifyAll();
-    }
-
-    /**
-     * Buffer one regular canonical byte, applying the input buffer's policy.
-     *
-     * @return {@code true} if the byte was accepted (or processed), {@code false}
-     *         if the caller must stop because the buffer is full/timed out
-     */
-    private boolean offerCanonicalByte(byte b, long timeoutMillis)
-            throws InterruptedException {
-        return editBuffer.appendReserved(inputBuffer, b, timeoutMillis,
-                config.input().overflowPolicy(), lock);
     }
 
     private void raiseSignal(PtySignal signal) {
@@ -264,12 +341,20 @@ public final class DefaultPtySession implements PtySession {
         if (vmin == 0) {
             long deadline = boundedDeadline(vtimeNanos, callerDeadline);
             if (inputBuffer.isEmptyHeld() && !inputEof && !closed) {
-                inputBuffer.awaitCountHeld(1, 0, deadline - System.nanoTime());
+                long waitNanos = deadline - System.nanoTime();
+                if (waitNanos > 0) {
+                    inputBuffer.awaitCountHeld(1, 0, waitNanos);
+                }
             }
             if (inputBuffer.isEmptyHeld()) {
-                return closed
-                        ? new ReadResult(new byte[0], false, true, false)
-                        : timeoutResult();
+                if (closed) {
+                    return new ReadResult(new byte[0], false, true, false);
+                }
+                if (inputEof) {
+                    inputEof = false;
+                    return new ReadResult(new byte[0], true, false, false);
+                }
+                return timeoutResult();
             }
             return takeRawAvailable(maxBytes);
         }
@@ -279,43 +364,32 @@ public final class DefaultPtySession implements PtySession {
         while (inputBuffer.sizeHeld() < vmin && !inputEof && !closed) {
             int before = inputBuffer.sizeHeld();
             long waitNanos;
-            if (vtimeNanos == 0) {
-                if (before > 0) {
-                    waitNanos = Long.MAX_VALUE / 2;
-                } else {
-                    waitNanos = callerDeadline == Long.MAX_VALUE
-                            ? Long.MAX_VALUE / 2
-                            : callerDeadline - System.nanoTime();
-                    if (callerDeadline != Long.MAX_VALUE && waitNanos <= 0) {
-                        return timeoutResult();
-                    }
-                }
-            } else if (before == 0) {
+            if (vtimeNanos == 0 || before == 0) {
+                // No inter-byte timer yet (VTIME=0 or no byte received so far).
                 idleDeadline = 0L;
                 waitNanos = callerDeadline == Long.MAX_VALUE
                         ? Long.MAX_VALUE / 2
                         : callerDeadline - System.nanoTime();
-                if (callerDeadline != Long.MAX_VALUE && waitNanos <= 0) {
-                    return timeoutResult();
-                }
             } else {
                 if (idleDeadline == 0L) {
                     idleDeadline = System.nanoTime() + vtimeNanos;
                 }
                 waitNanos = idleDeadline - System.nanoTime();
-                if (callerDeadline != Long.MAX_VALUE) {
-                    waitNanos = Math.min(waitNanos,
-                            callerDeadline - System.nanoTime());
-                }
-                if (waitNanos <= 0) {
-                    return takeRawAvailable(maxBytes);
-                }
+            }
+            if (callerDeadline != Long.MAX_VALUE) {
+                waitNanos = Math.min(waitNanos, callerDeadline - System.nanoTime());
+            }
+            if (waitNanos <= 0) {
+                boolean callerTimedOut = callerDeadline != Long.MAX_VALUE
+                        && (idleDeadline == 0L
+                                || callerDeadline <= idleDeadline);
+                return timeoutWithRawData(maxBytes, callerTimedOut);
             }
 
             int after = inputBuffer.awaitCountHeld(
                     vmin, before, Math.max(1L, waitNanos));
-            if (after > before) {
-                idleDeadline = 0L;
+            if (after > before && vtimeNanos > 0 && after < vmin) {
+                idleDeadline = System.nanoTime() + vtimeNanos;
             }
         }
         return takeRawAvailable(maxBytes);
@@ -328,6 +402,25 @@ public final class DefaultPtySession implements PtySession {
 
     private ReadResult timeoutResult() {
         return new ReadResult(new byte[0], false, false, true);
+    }
+
+    /**
+     * Return buffered bytes when the caller timeout elapsed before VMIN was met.
+     * The result reports both the partial data and the timeout condition.
+     */
+    private ReadResult timeoutWithRawData(int maxBytes, boolean callerTimedOut) {
+        if (!inputBuffer.isEmptyHeld()) {
+            return new ReadResult(inputBuffer.pollHeld(maxBytes),
+                    false, false, callerTimedOut);
+        }
+        if (closed) {
+            return new ReadResult(new byte[0], false, true, false);
+        }
+        if (inputEof) {
+            inputEof = false;
+            return new ReadResult(new byte[0], true, false, false);
+        }
+        return new ReadResult(new byte[0], false, false, callerTimedOut);
     }
 
     private ReadResult takeRawAvailable(int maxBytes) {
@@ -581,7 +674,10 @@ public final class DefaultPtySession implements PtySession {
     @Override
     public int inputBufferSize() {
         synchronized (lock) {
-            return inputBuffer.sizeHeld();
+            return inputBuffer.sizeHeld()
+                    + (config.mode() == LineDisciplineMode.CANONICAL
+                            ? editBuffer.pendingSize()
+                            : 0);
         }
     }
 
